@@ -2,6 +2,8 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import fs from 'fs';
+import path from 'path';
 import { pool, query } from './db.js';
 
 // Routers
@@ -20,58 +22,47 @@ import usersRouter from './routes/users.js';
 import analyticsRouter from './routes/analytics.js';
 import featuredVehiclesRouter from './routes/featuredVehicles.js';
 
-import fs from 'fs';
-import path from 'path';
-
 const app = express();
 
 /* -----------------------------
-   Security & CORS
+   🛡 Security & CORS
 ------------------------------ */
-
-// If you're on Render behind a proxy, this helps trust X-Forwarded-* headers.
 app.set('trust proxy', 1);
 
-// Allow your EcoWeb frontend + common local dev origins
-const FRONTEND_ORIGIN =
-  process.env.FRONTEND_ORIGIN ||
-  'http://shynneautowash.somlanser.net'; // <-- your live frontend
-
-const allowedOrigins = new Set([
-  FRONTEND_ORIGIN,
-  'http://localhost:3000',
-  'http://localhost:5173',
-  'http://127.0.0.1:5173',
-]);
+const ORIGINS = (process.env.ALLOWED_ORIGINS ??
+  'https://shynneautowash.somlanser.net,http://localhost:5173,http://127.0.0.1:5173')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 const corsOptions = {
   origin(origin, cb) {
-    // Allow same-origin / server-to-server / curl (no origin header)
+    // Allow same-origin / server-to-server (no Origin header)
     if (!origin) return cb(null, true);
-    // Exact-match check
-    if (allowedOrigins.has(origin)) return cb(null, true);
-    return cb(new Error(`CORS: Origin not allowed -> ${origin}`));
+    if (ORIGINS.includes(origin)) return cb(null, true);
+    console.warn(`🚫 CORS blocked origin: ${origin}`);
+    return cb(new Error(`CORS not allowed from origin: ${origin}`));
   },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type'],
+  credentials: false, // only enable if using cookies/sessions
+  optionsSuccessStatus: 204,
 };
 
 app.use(helmet());
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // Preflight
-
+app.options('*', cors(corsOptions)); // handle preflights globally
 app.use(express.json());
 
 /* -----------------------------
-   Health check
+   💚 Health check
 ------------------------------ */
 app.get('/health', (_req, res) =>
   res.json({ ok: true, time: new Date().toISOString() })
 );
 
 /* -----------------------------
-   Initialize DB (idempotent)
+   🧠 Initialize DB (idempotent)
 ------------------------------ */
 try {
   const initSql = fs.readFileSync(
@@ -83,16 +74,15 @@ try {
       await pool.query(initSql);
       console.log('✅ Database initialized (or already up to date).');
     } catch (e) {
-      console.error('DB init error', e);
+      console.error('❌ DB init error', e);
     }
   })();
 } catch (e) {
-  // If the file is missing in a production container, don't crash the app
   console.warn('⚠️ sql/001_init.sql not found or unreadable; skipping init.');
 }
 
 /* -----------------------------
-   Routes
+   🧩 Routes
 ------------------------------ */
 app.use('/auth', authRouter);
 app.use('/catalog', catalogRouter);
@@ -101,7 +91,7 @@ app.use('/expenses', expensesRouter);
 app.use('/reports', reportsRouter);
 app.use('/services', servicesRouter);
 app.use('/car-types', carTypesRouter);
-app.use('/', servicePricesRouter); // price upsert route
+app.use('/', servicePricesRouter);
 app.use('/staff', staffRoutes);
 app.use('/commissions', commissionRoutes);
 app.use('/settings', settingsRouter);
@@ -110,7 +100,7 @@ app.use('/analytics', analyticsRouter);
 app.use('/featured-vehicles', featuredVehiclesRouter);
 
 /* -----------------------------
-   Dashboard (today vs yesterday)
+   📊 Dashboard endpoint
 ------------------------------ */
 app.get('/dashboard/today-vs-yesterday', async (req, res) => {
   try {
@@ -159,7 +149,7 @@ app.get('/dashboard/today-vs-yesterday', async (req, res) => {
 });
 
 /* -----------------------------
-   Start server
+   🚀 Start server
 ------------------------------ */
 const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`API running on :${port}`));
+app.listen(port, () => console.log(`✅ API running on :${port}`));
