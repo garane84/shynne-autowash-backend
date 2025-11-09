@@ -9,28 +9,42 @@ const router = Router();
 
 /**
  * GET /catalog
- * Returns services, car_types, and their pricing relationships.
+ * Returns services, car_types, and their pricing relationships (with descriptions).
  */
 router.get("/", async (_req, res) => {
   try {
-    // ✅ Fetch all services (only existing columns)
+    // ✅ Fetch all services including descriptions
     const servicesRes = await query(`
-      SELECT id, name, base_price, is_active, created_at, updated_at
+      SELECT 
+        id, 
+        name, 
+        COALESCE(description, '') AS description, 
+        base_price, 
+        is_active, 
+        created_at, 
+        updated_at
       FROM services
-      ORDER BY name ASC
+      ORDER BY name ASC;
     `);
 
-    // ✅ Fetch all car types (only existing columns)
+    // ✅ Fetch all car types including descriptions
     const carTypesRes = await query(`
-      SELECT id, label, sort_order
+      SELECT 
+        id, 
+        label, 
+        COALESCE(description, '') AS description, 
+        sort_order
       FROM car_types
-      ORDER BY sort_order ASC, label ASC
+      ORDER BY sort_order ASC NULLS LAST, label ASC;
     `);
 
     // ✅ Fetch all service prices
     const pricesRes = await query(`
-      SELECT service_id, car_type_id, price
-      FROM service_prices
+      SELECT 
+        service_id, 
+        car_type_id, 
+        price
+      FROM service_prices;
     `);
 
     // ✅ Combine services with their prices
@@ -39,6 +53,7 @@ router.get("/", async (_req, res) => {
       prices: pricesRes.rows.filter((p) => p.service_id === s.id),
     }));
 
+    // ✅ Send structured response
     res.json({
       services,
       car_types: carTypesRes.rows,

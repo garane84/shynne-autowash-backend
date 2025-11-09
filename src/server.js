@@ -21,6 +21,7 @@ import settingsRouter from './routes/settings.js';
 import usersRouter from './routes/users.js';
 import analyticsRouter from './routes/analytics.js';
 import featuredVehiclesRouter from './routes/featuredVehicles.js';
+import freeWashDraw from "./routes/freeWashDraw.js"; // ✅ already imported
 
 const app = express();
 
@@ -98,6 +99,9 @@ app.use('/settings', settingsRouter);
 app.use('/users', usersRouter);
 app.use('/analytics', analyticsRouter);
 app.use('/featured-vehicles', featuredVehiclesRouter);
+
+// ✅ NEW: mount the draw/promotion endpoints (random free wash selection, etc.)
+app.use('/promotions', freeWashDraw);
 
 /* -----------------------------
    📊 Dashboard endpoint

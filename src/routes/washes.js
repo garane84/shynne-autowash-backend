@@ -34,7 +34,7 @@ async function generateUniqueReceiptNo() {
    Helpers for promotions (existing + new)
 ------------------------------------------- */
 async function getAppSettings() {
-  const { rows } = await query("SELECT * FROM app_settings WHERE id=1");
+  const { rows } = await query("SELECT * FROM app_settings LIMIT 1");
   return rows[0] || {};
 }
 
@@ -74,7 +74,7 @@ async function getLoyaltyPromoId() {
   return rows[0]?.id || null;
 }
 
-/* ✅ Featured vehicles monthly reward (NEW) */
+/* ✅ Featured vehicles monthly reward */
 function firstDayOfMonth(d) {
   const dt = d ? new Date(d) : new Date();
   return new Date(dt.getFullYear(), dt.getMonth(), 1);
@@ -155,6 +155,40 @@ async function upsertCustomer({ name, phone, vehicle_reg }) {
   return customer.id;
 }
 
+/* ⭐ Daily draw helpers (manual-approval compatible) */
+async function getDailyWinnerRow(dayISO) {
+  const { rows } = await query(
+    `SELECT * FROM daily_free_winners WHERE draw_date = $1::date LIMIT 1`,
+    [dayISO]
+  );
+  return rows[0] || null;
+}
+async function markDailyWinnerUsed(id) {
+  await query(
+    `UPDATE daily_free_winners SET used_at = now() WHERE id = $1::uuid AND used_at IS NULL`,
+    [id]
+  );
+}
+async function getDailyDrawPromoId() {
+  const { rows } = await query(
+    "SELECT id FROM promotions WHERE code='DAILY_DRAW' AND is_active=TRUE"
+  );
+  return rows[0]?.id || null;
+}
+
+/* Small normalizers to make matching robust */
+function normPlate(s) {
+  if (!s) return "";
+  return s.toString().toUpperCase().replace(/\s|-/g, "").trim();
+}
+function normPhone(s) {
+  if (!s) return "";
+  return s.toString().replace(/\D+/g, ""); // keep digits only
+}
+
+/* Kenyan registration: AAA999A (7 chars, no spaces/dashes) */
+const KE_PLATE_RE = /^[A-Z]{3}\d{3}[A-Z]$/;
+
 /* ================================
    CREATE WASH (Admin / Manager)
 ================================ */
@@ -173,10 +207,18 @@ router.post("/", requireRole("ADMIN", "MANAGER"), async (req, res) => {
     vehicle_reg,
   } = req.body;
 
-  if (!service_id || !car_type_id)
+  // 🔒 Required fields & Kenyan plate validation
+  const vehicleRegClean = normPlate(vehicle_reg);
+  if (!service_id || !car_type_id || !staff_id || !vehicleRegClean) {
     return res
       .status(400)
-      .json({ error: "service_id and car_type_id are required." });
+      .json({ error: "service_id, car_type_id, staff_id and vehicle_reg are required." });
+  }
+  if (!KE_PLATE_RE.test(vehicleRegClean)) {
+    return res
+      .status(400)
+      .json({ error: "vehicle_reg must match Kenyan format: e.g. KDP547Z (AAA999A)." });
+  }
 
   try {
     // Get default price if not provided
@@ -196,7 +238,7 @@ router.post("/", requireRole("ADMIN", "MANAGER"), async (req, res) => {
       price = rows[0].price;
     }
 
-    // Promo / Loyalty evaluation (priority: Featured > Loyalty 13th > Random)
+    // Promo / Loyalty evaluation (priority: Daily Draw > Featured > Loyalty 13th > Random)
     let customerId = null;
     let isFree = false;
     let promoId = null;
@@ -206,34 +248,66 @@ router.post("/", requireRole("ADMIN", "MANAGER"), async (req, res) => {
       customerId = await upsertCustomer({
         name: customer_name,
         phone: customer_phone,
-        vehicle_reg,
+        vehicle_reg: vehicleRegClean,
       });
 
-      /* (0) Featured vehicle free once per month */
-      const featured = await isVehicleFeaturedForMonth(vehicle_reg, washed_at);
-      if (featured) {
-        const alreadyUsed = await hasUsedFeaturedRewardThisMonth(
-          vehicle_reg,
-          washed_at
-        );
-        // You can also respect app_settings.featured_free_once_per_month (default true)
-        const settings = await getAppSettings();
-        const enforceOnce =
-          settings.featured_free_once_per_month !== false; // default true
-        const canGrant = enforceOnce ? !alreadyUsed : true;
+      const washed = washed_at ? new Date(washed_at) : new Date();
+      const washedISO = washed.toISOString().slice(0, 10); // YYYY-MM-DD
 
-        if (canGrant) {
-          const fPromo = await getFeaturedPromoId();
-          if (fPromo) {
+      /* ⭐ Daily draw winner check — applies ONLY if you approved someone for that day */
+      const winner = await getDailyWinnerRow(washedISO);
+      if (winner && !winner.used_at && !isFree) {
+        const matchByCustomer =
+          !!customerId && !!winner.customer_id && customerId === winner.customer_id;
+
+        const matchByPhone =
+          !!customer_phone &&
+          !!winner.customer_phone &&
+          normPhone(customer_phone) === normPhone(winner.customer_phone);
+
+        const matchByReg =
+          !!vehicleRegClean &&
+          !!winner.vehicle_reg &&
+          normPlate(vehicleRegClean) === normPlate(winner.vehicle_reg);
+
+        if (matchByCustomer || matchByPhone || matchByReg) {
+          const ddPromo = await getDailyDrawPromoId();
+          if (ddPromo) {
             isFree = true;
             price = 0;
             commissionPctEffective = 0;
-            promoId = fPromo;
+            promoId = ddPromo;
+            await markDailyWinnerUsed(winner.id); // consume benefit immediately
           }
         }
       }
 
-      /* (1) Loyalty: every 13th wash this month => FREE (only if not already free) */
+      /* (1) Featured vehicle free once per month */
+      if (!isFree) {
+        const featured = await isVehicleFeaturedForMonth(vehicleRegClean, washed_at);
+        if (featured) {
+          const alreadyUsed = await hasUsedFeaturedRewardThisMonth(
+            vehicleRegClean,
+            washed_at
+          );
+          const settings = await getAppSettings();
+          const enforceOnce =
+            settings.featured_free_once_per_month !== false; // default true
+          const canGrant = enforceOnce ? !alreadyUsed : true;
+
+          if (canGrant) {
+            const fPromo = await getFeaturedPromoId();
+            if (fPromo) {
+              isFree = true;
+              price = 0;
+              commissionPctEffective = 0;
+              promoId = fPromo;
+            }
+          }
+        }
+      }
+
+      /* (2) Loyalty: every 13th wash this month => FREE (only if not already free) */
       if (!isFree && customerId) {
         const cnt = await countCustomerWashesThisMonth(customerId, washed_at);
         if ((cnt + 1) % 13 === 0) {
@@ -244,7 +318,7 @@ router.post("/", requireRole("ADMIN", "MANAGER"), async (req, res) => {
         }
       }
 
-      /* (2) Random promo only if not already free */
+      /* (3) Random promo only if not already free */
       if (!isFree) {
         const s = await getAppSettings();
         const promoEnabled = !!s.promo_free_enabled;
@@ -285,15 +359,14 @@ router.post("/", requireRole("ADMIN", "MANAGER"), async (req, res) => {
 
     // Commission & profit
     const commission_amount =
-      Math.round(((Number(price) * commissionPctEffective) / 100.0) * 100) /
-      100;
+      Math.round(((Number(price) * commissionPctEffective) / 100.0) * 100) / 100;
     const profit_amount =
       Math.round((Number(price) - commission_amount) * 100) / 100;
 
     // New SH-style receipt number
     const receiptNo = await generateUniqueReceiptNo();
 
-    // Insert wash  (NOTE: now also storing vehicle_reg)
+    // Insert wash  (NOTE: now also storing normalized vehicle_reg)
     const { rows } = await query(
       `
       INSERT INTO washes (
@@ -324,7 +397,7 @@ router.post("/", requireRole("ADMIN", "MANAGER"), async (req, res) => {
         customerId,
         promoId,
         isFree,
-        vehicle_reg || null,
+        vehicleRegClean || null,
       ]
     );
 
